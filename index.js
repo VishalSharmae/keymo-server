@@ -185,10 +185,11 @@ setInterval(() => {
 const responseCache = new Map()
 const cacheOrder    = []
 
-function getCacheKey(system, message, provider) {
+function getCacheKey(system, message, provider, temperature) {
+    const t = temperature ?? 'default'
     return crypto
         .createHash('md5')
-        .update(`${provider}:${system}:${message}`)
+        .update(`${provider}:${t}:${system}:${message}`)
         .digest('hex')
 }
 
@@ -255,7 +256,17 @@ function estimateTokens(text) {
 
 // ─── Anthropic Streaming ──────────────────────────────────────────────────────
 
-async function streamAnthropic(system, messages, res) {
+async function streamAnthropic(system, messages, res, opts = {}) {
+    const body = {
+        model:      CONFIG.anthropicModel,
+        max_tokens: opts.max_tokens     ?? 1024,
+        stream:     true,
+        system,
+        messages
+    }
+    if (opts.temperature    !== undefined) body.temperature    = opts.temperature
+    if (opts.stop_sequences?.length)       body.stop_sequences = opts.stop_sequences
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
         method:  'POST',
         headers: {
@@ -263,13 +274,7 @@ async function streamAnthropic(system, messages, res) {
             'x-api-key':         CONFIG.anthropicKey,
             'anthropic-version': '2023-06-01'
         },
-        body: JSON.stringify({
-            model:      CONFIG.anthropicModel,
-            max_tokens: 1024,
-            stream:     true,
-            system,
-            messages
-        })
+        body: JSON.stringify(body)
     })
 
     if (!response.ok) {
@@ -307,12 +312,15 @@ async function streamAnthropic(system, messages, res) {
 
 // ─── OpenAI Streaming ─────────────────────────────────────────────────────────
 
-async function streamOpenAI(system, messages, res) {
-    // OpenAI uses system message as first message, not a separate field
-    const openaiMessages = [
-        { role: 'system', content: system },
-        ...messages
-    ]
+async function streamOpenAI(system, messages, res, opts = {}) {
+    const body = {
+        model:      CONFIG.openaiModel,
+        max_tokens: opts.max_tokens     ?? 1024,
+        stream:     true,
+        messages:   [{ role: 'system', content: system }, ...messages]
+    }
+    if (opts.temperature !== undefined) body.temperature = opts.temperature
+    if (opts.stop_sequences?.length)    body.stop        = opts.stop_sequences
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method:  'POST',
@@ -320,11 +328,7 @@ async function streamOpenAI(system, messages, res) {
             'Content-Type':  'application/json',
             'Authorization': `Bearer ${CONFIG.openaiKey}`
         },
-        body: JSON.stringify({
-            model:      CONFIG.openaiModel,
-            max_tokens: 1024,
-            stream:     true,
-            messages:   openaiMessages
+        body: JSON.stringify(body)
         })
     })
 
@@ -367,7 +371,15 @@ app.post('/rewrite', async (req, res) => {
                || req.socket.remoteAddress
                || 'unknown'
 
-    const { messages, system, provider: requestedProvider } = req.body
+    const {
+    messages,
+    system,
+    provider:      requestedProvider,
+    temperature,
+    max_tokens,
+    stop_sequences,
+    isRetry
+} = req.body
 
     // ── Validate request body ────────────────────────────────────
     if (!messages || !Array.isArray(messages) || !system) {
@@ -407,8 +419,8 @@ app.post('/rewrite', async (req, res) => {
 
     // ── Cache check ──────────────────────────────────────────────
     const provider = requestedProvider || CONFIG.provider
-    const cacheKey = getCacheKey(system, userMessage, provider)
-    const cached   = getFromCache(cacheKey)
+    const cacheKey = getCacheKey(system, userMessage, provider, temperature)
+    const cached   = !isRetry ? getFromCache(cacheKey) : null
 
     if (cached) {
         stats.cacheHits++
@@ -441,14 +453,16 @@ app.post('/rewrite', async (req, res) => {
     try {
         let fullText = ''
 
+        const opts = { temperature, max_tokens, stop_sequences }
+
         if (provider === 'openai') {
-            fullText = await streamOpenAI(system, messages, res)
+            fullText = await streamOpenAI(system, messages, res, opts)
         } else {
-            fullText = await streamAnthropic(system, messages, res)
+            fullText = await streamAnthropic(system, messages, res, opts)
         }
 
         // Cache completed response
-        if (fullText.trim()) {
+        if (fullText.trim() && !isRetry) {
             setInCache(cacheKey, fullText)
             const outputTokens = estimateTokens(fullText)
             stats.estimatedTokens += outputTokens
