@@ -329,7 +329,6 @@ async function streamOpenAI(system, messages, res, opts = {}) {
             'Authorization': `Bearer ${CONFIG.openaiKey}`
         },
         body: JSON.stringify(body)
-        })
     })
 
     if (!response.ok) {
