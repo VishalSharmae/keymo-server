@@ -446,7 +446,7 @@ app.post('/rewrite', async (req, res) => {
     }
 
     const userMessage = messages.find(m => m.role === 'user')?.content || ''
-    uid = req.body.uid || null
+    let uid = req.body.uid || null
     const isPro = isUserPro(uid)
 
     // ── Abuse check ──────────────────────────────────────────────
