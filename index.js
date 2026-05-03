@@ -17,13 +17,15 @@
 //   500 rewrites / day
 
 const express = require('express')
-const fetch   = require('node-fetch')
-const cors    = require('cors')
-const crypto  = require('crypto')
-const app     = express()
+const fetch = require('node-fetch')
+const cors = require('cors')
+const crypto = require('crypto')
+const app = express()
 
 app.use(cors())
-app.use(express.json({ limit: '10kb' })) // reject oversized payloads immediately
+app.use(express.json({
+    limit: '10kb'
+})) // reject oversized payloads immediately
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 // All values readable from environment variables so you can tune
@@ -31,46 +33,46 @@ app.use(express.json({ limit: '10kb' })) // reject oversized payloads immediatel
 
 const CONFIG = {
     // Provider: 'anthropic' or 'openai'
-    provider:        process.env.LLM_PROVIDER       || 'anthropic',
+    provider: process.env.LLM_PROVIDER || 'anthropic',
 
     // API Keys — set in Railway Variables tab, never hardcode here
-    anthropicKey:    process.env.ANTHROPIC_API_KEY   || '',
-    openaiKey:       process.env.OPENAI_API_KEY       || '',
+    anthropicKey: process.env.ANTHROPIC_API_KEY || '',
+    openaiKey: process.env.OPENAI_API_KEY || '',
 
     // Models
-    anthropicModel:  process.env.ANTHROPIC_MODEL     || 'claude-haiku-4-5-20251001',
-    openaiModel:     process.env.OPENAI_MODEL         || 'gpt-4o-mini',
+    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
+    openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
 
     // Rate limits — free tier MVP
-    minuteLimit:     parseInt(process.env.RATE_LIMIT_PER_MINUTE) || 15,
-    hourLimit:       parseInt(process.env.RATE_LIMIT_PER_HOUR)   || 100,
-    dayLimit:        parseInt(process.env.RATE_LIMIT_PER_DAY)    || 500,
+    minuteLimit: parseInt(process.env.RATE_LIMIT_PER_MINUTE) || 15,
+    hourLimit: parseInt(process.env.RATE_LIMIT_PER_HOUR) || 100,
+    dayLimit: parseInt(process.env.RATE_LIMIT_PER_DAY) || 500,
 
     // Abuse protection
-    maxInputLength:  parseInt(process.env.MAX_INPUT_LENGTH)      || 1000,
-    maxSystemLength: parseInt(process.env.MAX_SYSTEM_LENGTH)     || 2000,
+    maxInputLength: parseInt(process.env.MAX_INPUT_LENGTH) || 1000,
+    maxSystemLength: parseInt(process.env.MAX_SYSTEM_LENGTH) || 2000,
 
     // Cache
-    cacheTTLMinutes: parseInt(process.env.CACHE_TTL_MINUTES)     || 60,
-    maxCacheEntries: parseInt(process.env.MAX_CACHE_ENTRIES)      || 500,
+    cacheTTLMinutes: parseInt(process.env.CACHE_TTL_MINUTES) || 60,
+    maxCacheEntries: parseInt(process.env.MAX_CACHE_ENTRIES) || 500,
 
     // Upgrade message shown when any limit is hit
-    upgradeMessage:  process.env.UPGRADE_MESSAGE
-                     || 'Get unlimited rewrites with Keymo Pro — coming soon.',
+    upgradeMessage: process.env.UPGRADE_MESSAGE ||
+        'Get unlimited rewrites with Keymo Pro — $5/month.',
 
-    port:            parseInt(process.env.PORT) || 3000
+    port: parseInt(process.env.PORT) || 3000
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
 const stats = {
-    totalRequests:   0,
-    cacheHits:       0,
+    totalRequests: 0,
+    cacheHits: 0,
     rateLimitBlocks: 0,
-    abuseBlocks:     0,
-    errors:          0,
+    abuseBlocks: 0,
+    errors: 0,
     estimatedTokens: 0,
-    startTime:       Date.now()
+    startTime: Date.now()
 }
 
 // ─── Rate Limiter ─────────────────────────────────────────────────────────────
@@ -81,69 +83,113 @@ const stats = {
 const rateLimitStore = new Map()
 
 const LIMITS = {
-    minute: { max: CONFIG.minuteLimit, windowMs: 60 * 1000,           label: 'minute' },
-    hour:   { max: CONFIG.hourLimit,   windowMs: 60 * 60 * 1000,      label: 'hour'   },
-    day:    { max: CONFIG.dayLimit,    windowMs: 24 * 60 * 60 * 1000, label: 'day'    }
+    minute: {
+        max: CONFIG.minuteLimit,
+        windowMs: 60 * 1000,
+        label: 'minute'
+    },
+    hour: {
+        max: CONFIG.hourLimit,
+        windowMs: 60 * 60 * 1000,
+        label: 'hour'
+    },
+    day: {
+        max: CONFIG.dayLimit,
+        windowMs: 24 * 60 * 60 * 1000,
+        label: 'day'
+    }
+}
+
+let paidUsers = new Map() // uid → expiry timestamp (ms)
+
+function savePaidUsers() {
+    const data = Object.fromEntries(paidUsers)
+    fs.writeFileSync(PAID_USERS_FILE, JSON.stringify(data))
+}
+
+function loadPaidUsers() {
+    try {
+        if (fs.existsSync(PAID_USERS_FILE)) {
+            const data = JSON.parse(fs.readFileSync(PAID_USERS_FILE, 'utf8'))
+            paidUsers = new Map(Object.entries(data))
+            console.log(`[startup] Loaded ${paidUsers.size} paid users`)
+        }
+    } catch (e) {
+        console.error('[startup] Could not load paid users:', e.message)
+    }
+}
+
+loadPaidUsers()
+
+// Check if user is currently pro
+function isUserPro(uid) {
+    if (!uid || !paidUsers.has(uid)) return false
+    const expiresAt = paidUsers.get(uid)
+    return Date.now() < expiresAt // still valid if expiry is in the future
 }
 
 function formatTimeRemaining(ms) {
     const seconds = Math.ceil(ms / 1000)
     const minutes = Math.ceil(ms / 60000)
-    const hours   = Math.ceil(ms / 3600000)
+    const hours = Math.ceil(ms / 3600000)
 
-    if (seconds < 60)  return `${seconds} second${seconds === 1 ? '' : 's'}`
-    if (minutes < 60)  return `${minutes} minute${minutes === 1 ? '' : 's'}`
+    if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`
+    if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'}`
     return `${hours} hour${hours === 1 ? '' : 's'}`
 }
 
 function checkRateLimit(ip) {
-    const now   = Date.now()
-    const entry = rateLimitStore.get(ip) || { minute: [], hour: [], day: [] }
+    const now = Date.now()
+    const entry = rateLimitStore.get(ip) || {
+        minute: [],
+        hour: [],
+        day: []
+    }
 
     // Slide all three windows — remove expired timestamps
     entry.minute = entry.minute.filter(t => now - t < LIMITS.minute.windowMs)
-    entry.hour   = entry.hour.filter(t =>   now - t < LIMITS.hour.windowMs)
-    entry.day    = entry.day.filter(t =>    now - t < LIMITS.day.windowMs)
+    entry.hour = entry.hour.filter(t => now - t < LIMITS.hour.windowMs)
+    entry.day = entry.day.filter(t => now - t < LIMITS.day.windowMs)
 
     // ── Per-minute check ──────────────────────────────────────────
     if (entry.minute.length >= LIMITS.minute.max) {
-        const resetsAt    = entry.minute[0] + LIMITS.minute.windowMs
-        const timeLeft    = resetsAt - now
-        const timeStr     = formatTimeRemaining(timeLeft)
+        const resetsAt = entry.minute[0] + LIMITS.minute.windowMs
+        const timeLeft = resetsAt - now
+        const timeStr = formatTimeRemaining(timeLeft)
         return {
-            limited:   true,
-            window:    'minute',
-            limit:     LIMITS.minute.max,
+            limited: true,
+            window: 'minute',
+            limit: LIMITS.minute.max,
             resetsAt,
-            message:   `Per-minute limit reached (${LIMITS.minute.max} rewrites/min). Resets in ${timeStr}.`
+            message: `Per-minute limit reached (${LIMITS.minute.max} rewrites/min). Resets in ${timeStr}.`
         }
     }
 
     // ── Per-hour check ────────────────────────────────────────────
     if (entry.hour.length >= LIMITS.hour.max) {
-        const resetsAt    = entry.hour[0] + LIMITS.hour.windowMs
-        const timeLeft    = resetsAt - now
-        const timeStr     = formatTimeRemaining(timeLeft)
+        const resetsAt = entry.hour[0] + LIMITS.hour.windowMs
+        const timeLeft = resetsAt - now
+        const timeStr = formatTimeRemaining(timeLeft)
         return {
-            limited:   true,
-            window:    'hour',
-            limit:     LIMITS.hour.max,
+            limited: true,
+            window: 'hour',
+            limit: LIMITS.hour.max,
             resetsAt,
-            message:   `Hourly limit reached (${LIMITS.hour.max} rewrites/hr). Resets in ${timeStr}.`
+            message: `Hourly limit reached (${LIMITS.hour.max} rewrites/hr). Resets in ${timeStr}.`
         }
     }
 
     // ── Per-day check ─────────────────────────────────────────────
     if (entry.day.length >= LIMITS.day.max) {
-        const resetsAt    = entry.day[0] + LIMITS.day.windowMs
-        const timeLeft    = resetsAt - now
-        const timeStr     = formatTimeRemaining(timeLeft)
+        const resetsAt = entry.day[0] + LIMITS.day.windowMs
+        const timeLeft = resetsAt - now
+        const timeStr = formatTimeRemaining(timeLeft)
         return {
-            limited:   true,
-            window:    'day',
-            limit:     LIMITS.day.max,
+            limited: true,
+            window: 'day',
+            limit: LIMITS.day.max,
             resetsAt,
-            message:   `Daily limit reached (${LIMITS.day.max} rewrites/day). Resets in ${timeStr}.`
+            message: `Daily limit reached (${LIMITS.day.max} rewrites/day). Resets in ${timeStr}.`
         }
     }
 
@@ -154,18 +200,18 @@ function checkRateLimit(ip) {
     rateLimitStore.set(ip, entry)
 
     return {
-        limited:         false,
+        limited: false,
         minuteRemaining: LIMITS.minute.max - entry.minute.length,
-        hourRemaining:   LIMITS.hour.max   - entry.hour.length,
-        dayRemaining:    LIMITS.day.max    - entry.day.length
+        hourRemaining: LIMITS.hour.max - entry.hour.length,
+        dayRemaining: LIMITS.day.max - entry.day.length
     }
 }
 
 // Clean up stale IP entries every hour to prevent memory growth
 setInterval(() => {
-    const now    = Date.now()
+    const now = Date.now()
     const oneDay = 24 * 60 * 60 * 1000
-    let   removed = 0
+    let removed = 0
     for (const [ip, entry] of rateLimitStore.entries()) {
         const hasActivity = entry.day.some(t => now - t < oneDay)
         if (!hasActivity) {
@@ -183,7 +229,7 @@ setInterval(() => {
 // Identical rewrites return instantly — no API call, no cost, no latency.
 
 const responseCache = new Map()
-const cacheOrder    = []
+const cacheOrder = []
 
 function getCacheKey(system, message, provider, temperature) {
     const t = temperature ?? 'default'
@@ -197,7 +243,7 @@ function getFromCache(key) {
     const entry = responseCache.get(key)
     if (!entry) return null
 
-    const ageMs  = Date.now() - entry.timestamp
+    const ageMs = Date.now() - entry.timestamp
     const maxAge = CONFIG.cacheTTLMinutes * 60 * 1000
 
     if (ageMs > maxAge) {
@@ -214,7 +260,10 @@ function setInCache(key, value) {
         const oldest = cacheOrder.shift()
         if (oldest) responseCache.delete(oldest)
     }
-    responseCache.set(key, { value, timestamp: Date.now() })
+    responseCache.set(key, {
+        value,
+        timestamp: Date.now()
+    })
     cacheOrder.push(key)
 }
 
@@ -236,15 +285,20 @@ function checkForAbuse(input) {
     if (input.length > CONFIG.maxInputLength) {
         return {
             abusive: true,
-            reason:  `Input too long (${input.length} chars, max ${CONFIG.maxInputLength})`
+            reason: `Input too long (${input.length} chars, max ${CONFIG.maxInputLength})`
         }
     }
     for (const pattern of ABUSE_PATTERNS) {
         if (pattern.test(input)) {
-            return { abusive: true, reason: 'Input contains disallowed content' }
+            return {
+                abusive: true,
+                reason: 'Input contains disallowed content'
+            }
         }
     }
-    return { abusive: false }
+    return {
+        abusive: false
+    }
 }
 
 // ─── Token Estimator ──────────────────────────────────────────────────────────
@@ -258,20 +312,20 @@ function estimateTokens(text) {
 
 async function streamAnthropic(system, messages, res, opts = {}) {
     const body = {
-        model:      CONFIG.anthropicModel,
-        max_tokens: opts.max_tokens     ?? 1024,
-        stream:     true,
+        model: CONFIG.anthropicModel,
+        max_tokens: opts.max_tokens ?? 1024,
+        stream: true,
         system,
         messages
     }
-    if (opts.temperature    !== undefined) body.temperature    = opts.temperature
-    if (opts.stop_sequences?.length)       body.stop_sequences = opts.stop_sequences
+    if (opts.temperature !== undefined) body.temperature = opts.temperature
+    if (opts.stop_sequences?.length) body.stop_sequences = opts.stop_sequences
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method:  'POST',
+        method: 'POST',
         headers: {
-            'Content-Type':      'application/json',
-            'x-api-key':         CONFIG.anthropicKey,
+            'Content-Type': 'application/json',
+            'x-api-key': CONFIG.anthropicKey,
             'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify(body)
@@ -305,7 +359,7 @@ async function streamAnthropic(system, messages, res, opts = {}) {
             }
         })
 
-        response.body.on('end',   () => resolve(fullText))
+        response.body.on('end', () => resolve(fullText))
         response.body.on('error', reject)
     })
 }
@@ -314,18 +368,21 @@ async function streamAnthropic(system, messages, res, opts = {}) {
 
 async function streamOpenAI(system, messages, res, opts = {}) {
     const body = {
-        model:      CONFIG.openaiModel,
-        max_tokens: opts.max_tokens     ?? 1024,
-        stream:     true,
-        messages:   [{ role: 'system', content: system }, ...messages]
+        model: CONFIG.openaiModel,
+        max_tokens: opts.max_tokens ?? 1024,
+        stream: true,
+        messages: [{
+            role: 'system',
+            content: system
+        }, ...messages]
     }
     if (opts.temperature !== undefined) body.temperature = opts.temperature
-    if (opts.stop_sequences?.length)    body.stop        = opts.stop_sequences
+    if (opts.stop_sequences?.length) body.stop = opts.stop_sequences
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method:  'POST',
+        method: 'POST',
         headers: {
-            'Content-Type':  'application/json',
+            'Content-Type': 'application/json',
             'Authorization': `Bearer ${CONFIG.openaiKey}`
         },
         body: JSON.stringify(body)
@@ -348,14 +405,14 @@ async function streamOpenAI(system, messages, res, opts = {}) {
                 const data = line.slice(6)
                 if (data === '[DONE]') continue
                 try {
-                    const json  = JSON.parse(data)
+                    const json = JSON.parse(data)
                     const token = json.choices?.[0]?.delta?.content
                     if (token) fullText += token
                 } catch {}
             }
         })
 
-        response.body.on('end',   () => resolve(fullText))
+        response.body.on('end', () => resolve(fullText))
         response.body.on('error', reject)
     })
 }
@@ -366,60 +423,86 @@ app.post('/rewrite', async (req, res) => {
     stats.totalRequests++
 
     // Get real IP (Railway sits behind a proxy)
-    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim()
-               || req.socket.remoteAddress
-               || 'unknown'
+    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+        req.socket.remoteAddress ||
+        'unknown'
 
     const {
-    messages,
-    system,
-    provider:      requestedProvider,
-    temperature,
-    max_tokens,
-    stop_sequences,
-    isRetry
-} = req.body
+        messages,
+        system,
+        provider: requestedProvider,
+        temperature,
+        max_tokens,
+        stop_sequences,
+        isRetry,
+        uid
+    } = req.body
 
     // ── Validate request body ────────────────────────────────────
     if (!messages || !Array.isArray(messages) || !system) {
-        return res.status(400).json({ error: 'Invalid request body' })
+        return res.status(400).json({
+            error: 'Invalid request body'
+        })
     }
 
     const userMessage = messages.find(m => m.role === 'user')?.content || ''
+    const uid = req.body.uid || null
+    const isPro = isUserPro(uid)
 
     // ── Abuse check ──────────────────────────────────────────────
     const abuseCheck = checkForAbuse(userMessage)
     if (abuseCheck.abusive) {
         stats.abuseBlocks++
         console.warn(`[abuse] ${ip}: ${abuseCheck.reason}`)
-        return res.status(400).json({ error: 'Invalid input' })
+        return res.status(400).json({
+            error: 'Invalid input'
+        })
     }
 
     if (system.length > CONFIG.maxSystemLength) {
         stats.abuseBlocks++
-        return res.status(400).json({ error: 'Invalid request' })
+        return res.status(400).json({
+            error: 'Invalid request'
+        })
     }
+    const identifier = req.body.uid || ip
+    const maxInput = isPro ? 5000 : 500
+    const dailyLim = isPro ? 999999 : 25
 
     // ── Rate limit check ─────────────────────────────────────────
-    const rateCheck = checkRateLimit(ip)
-    if (rateCheck.limited) {
-        stats.rateLimitBlocks++
-        console.warn(`[rate-limit] ${ip} | ${rateCheck.window}: ${rateCheck.message}`)
+    if (!isPro) {
+        const rateCheck = checkRateLimit(identifier)
+        if (rateCheck.limited) {
+            stats.rateLimitBlocks++
+            console.warn(`[rate-limit] ${ip} | ${rateCheck.window}: ${rateCheck.message}`)
 
-        return res.status(429).json({
-            error:   'rate_limited',
-            window:  rateCheck.window,           // 'minute' | 'hour' | 'day'
-            message: rateCheck.message,          // human-readable limit message
-            resetsAt: rateCheck.resetsAt,        // Unix ms timestamp — app formats this
-            limit:   rateCheck.limit,            // the max for this window
-            upgrade: CONFIG.upgradeMessage       // upgrade nudge
-        })
+            return res.status(429).json({
+                error: 'rate_limited',
+                window: rateCheck.window, // 'minute' | 'hour' | 'day'
+                message: rateCheck.message, // human-readable limit message
+                resetsAt: rateCheck.resetsAt, // Unix ms timestamp — app formats this
+                limit: rateCheck.limit, // the max for this window
+                upgrade: CONFIG.upgradeMessage // upgrade nudge
+            })
+        }
+    }
+
+    // ── Message limit check ─────────────────────────────────────────
+    if (userMessage.length > maxInput) {
+        return res.status(400).json({
+            error: 'input_too_long',
+            message: `Your input is ${userMessage.length} characters. ${isPro ? 
+            `Keymo Pro supports up to ${maxInput} characters.` : 
+            `Free tier supports up to ${maxInput} characters.`}`,
+            upgrade: isPro ?
+                undefined : 'Upgrade to Keymo Pro — $5/month for up to 5,000 characters.'
+        });
     }
 
     // ── Cache check ──────────────────────────────────────────────
     const provider = requestedProvider || CONFIG.provider
     const cacheKey = getCacheKey(system, userMessage, provider, temperature)
-    const cached   = !isRetry ? getFromCache(cacheKey) : null
+    const cached = !isRetry ? getFromCache(cacheKey) : null
 
     if (cached) {
         stats.cacheHits++
@@ -441,18 +524,22 @@ app.post('/rewrite', async (req, res) => {
     stats.estimatedTokens += inputTokens
     console.log(`[request] ${ip} | ${provider} | ~${inputTokens} tokens | min:${rateCheck.minuteRemaining} hr:${rateCheck.hourRemaining} day:${rateCheck.dayRemaining}`)
 
-    res.setHeader('Content-Type',       'text/event-stream')
-    res.setHeader('Cache-Control',      'no-cache')
-    res.setHeader('X-Cache',            'MISS')
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('X-Cache', 'MISS')
     res.setHeader('X-Minute-Remaining', rateCheck.minuteRemaining)
-    res.setHeader('X-Hour-Remaining',   rateCheck.hourRemaining)
-    res.setHeader('X-Day-Remaining',    rateCheck.dayRemaining)
+    res.setHeader('X-Hour-Remaining', rateCheck.hourRemaining)
+    res.setHeader('X-Day-Remaining', rateCheck.dayRemaining)
 
     // ── Stream from provider ─────────────────────────────────────
     try {
         let fullText = ''
 
-        const opts = { temperature, max_tokens, stop_sequences }
+        const opts = {
+            temperature,
+            max_tokens,
+            stop_sequences
+        }
 
         if (provider === 'openai') {
             fullText = await streamOpenAI(system, messages, res, opts)
@@ -470,19 +557,189 @@ app.post('/rewrite', async (req, res) => {
 
         res.end()
 
+        const fs = require('fs')
+
+        function logUsageEvent(userId, mode, context, cached) {
+            const event = {
+                ts: new Date().toISOString(),
+                uid: userId, // anonymous local ID from Keychain
+                mode,
+                context,
+                cached,
+                day: new Date().toISOString().split('T')[0]
+            }
+            // Append to a daily log file — simple, no database needed
+            const logFile = `/tmp/keymo-usage-${event.day}.jsonl`
+            fs.appendFileSync(logFile, JSON.stringify(event) + '\n')
+        }
+
     } catch (error) {
         stats.errors++
         console.error(`[error] ${ip}: ${error.message}`)
         if (!res.headersSent) {
-            res.status(500).json({ error: 'AI provider error. Please try again.' })
+            res.status(500).json({
+                error: 'AI provider error. Please try again.'
+            })
         } else {
             res.end()
         }
     }
 })
 
-// ─── /health ──────────────────────────────────────────────────────────────────
+// ─── /stats ──────────────────────────────────────────────────────────────────
 
+app.get('/stats/:password', (req, res) => {
+    if (req.params.password !== process.env.STATS_PASSWORD) {
+        return res.status(403).json({
+            error: 'nope'
+        })
+    }
+
+    const today = new Date().toISOString().split('T')[0]
+    const logFile = `/tmp/keymo-usage-${today}.jsonl`
+
+    if (!fs.existsSync(logFile)) {
+        return res.json({
+            today: 0,
+            uniqueUsers: 0,
+            topMode: 'none'
+        })
+    }
+
+    const lines = fs.readFileSync(logFile, 'utf8')
+        .trim().split('\n').filter(Boolean)
+        .map(l => JSON.parse(l))
+
+    const uniqueUsers = new Set(lines.map(l => l.uid)).size
+    const modes = lines.reduce((acc, l) => {
+        acc[l.mode] = (acc[l.mode] || 0) + 1
+        return acc
+    }, {})
+    const topMode = Object.entries(modes)
+        .sort((a, b) => b[1] - a[1])[0]?.[0]
+
+    res.json({
+        today: lines.length,
+        uniqueUsers,
+        topMode,
+        cacheHitRate: `${((lines.filter(l => l.cached).length / lines.length) * 100).toFixed(1)}%`,
+        modes
+    })
+})
+
+// ─── /webhook/payment - Webhook endpoint — called by LemonSqueezy on payment ──────────────────────────────────────────────────────────────────
+app.post('/webhook/payment', (req, res) => {
+    const event = req.body
+    const eventName = event.meta?.event_name
+    const uid = event.meta?.custom_data?.uid
+
+    console.log(`[webhook] Event: ${eventName}, uid: ${uid?.substring(0, 8)}...`)
+
+    // ── New subscription created ──────────────────────────────
+    if (eventName === 'subscription_created') {
+        if (uid) {
+            // Set expiry to 35 days from now
+            // (31 days billing + 4 days grace period for payment retries)
+            const expiresAt = Date.now() + (35 * 24 * 60 * 60 * 1000)
+            paidUsers.set(uid, expiresAt)
+            savePaidUsers()
+            console.log(`[payment] Pro granted until: ${new Date(expiresAt).toISOString()}`)
+        }
+    }
+
+    // ── Subscription renewed (monthly payment succeeded) ──────
+    if (eventName === 'subscription_payment_success') {
+        if (uid) {
+            // Extend by another 35 days from now
+            const expiresAt = Date.now() + (35 * 24 * 60 * 60 * 1000)
+            paidUsers.set(uid, expiresAt)
+            savePaidUsers()
+            console.log(`[payment] Pro renewed until: ${new Date(expiresAt).toISOString()}`)
+        }
+    }
+
+    // ── Subscription cancelled ────────────────────────────────
+    // IMPORTANT: Do NOT remove user immediately.
+    // They paid for the current period — honour it.
+    // Lemon Squeezy also sends the period end date in the event.
+    if (eventName === 'subscription_cancelled') {
+        if (uid) {
+            // Get the period end date from Lemon Squeezy's event
+            // This is when they actually lose access
+            const endsAt = event.data?.attributes?.ends_at ||
+                event.data?.attributes?.renews_at
+
+            if (endsAt) {
+                // Set expiry to their actual period end date
+                const expiresAt = new Date(endsAt).getTime()
+                paidUsers.set(uid, expiresAt)
+                savePaidUsers()
+                console.log(`[payment] Cancelled — pro until: ${endsAt}`)
+            } else {
+                // Fallback: give 30 more days if we can't parse the date
+                const expiresAt = Date.now() + (30 * 24 * 60 * 60 * 1000)
+                paidUsers.set(uid, expiresAt)
+                savePaidUsers()
+                console.log(`[payment] Cancelled — fallback 30 day grace`)
+            }
+        }
+    }
+
+    // ── Subscription fully expired ────────────────────────────
+    // This fires AFTER the period ends — safe to revoke now
+    if (eventName === 'subscription_expired') {
+        if (uid) {
+            paidUsers.delete(uid)
+            savePaidUsers()
+            console.log(`[payment] Pro expired — revoked: ${uid?.substring(0, 8)}...`)
+        }
+    }
+
+    // ── Payment failed after all retries ─────────────────────
+    if (eventName === 'subscription_payment_failed') {
+        if (uid) {
+            // Give a 3 day grace period to update payment details
+            const expiresAt = Date.now() + (3 * 24 * 60 * 60 * 1000)
+            paidUsers.set(uid, expiresAt)
+            savePaidUsers()
+            console.log(`[payment] Payment failed — 3 day grace: ${uid?.substring(0, 8)}...`)
+        }
+    }
+
+    res.sendStatus(200)
+})
+
+// ─── /make-pro ──────────────────────────────────────────────────────────────────
+app.post('/admin/make-pro', (req, res) => {
+    if (req.body.password !== process.env.ADMIN_PASSWORD) {
+        return res.status(403).json({
+            error: 'no'
+        })
+    }
+    const expiresAt =
+        const expiresAt = Date.now() + (30 * 24 * 60 * 60 * 1000)
+    paidUsers.set(req.body.uid, expiresAt)
+    savePaidUsers()
+    res.json({
+        success: true,
+        proUsers: paidUsers.size
+    })
+})
+
+// ─── /pro-status ──────────────────────────────────────────────────────────────────
+app.get('/pro-status', (req, res) => {
+    const uid = req.query.uid
+    const isPro = isUserPro(uid)
+    const expiresAt = uid ? paidUsers.get(uid) : null
+
+    res.json({
+        isPro,
+        // Tell the app when access expires so it can show the user
+        expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null
+    })
+})
+
+// ─── /health ──────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
     const uptimeHours = ((Date.now() - stats.startTime) / 3600000).toFixed(1)
 
@@ -490,30 +747,29 @@ app.get('/health', (req, res) => {
     const estimatedCost = ((stats.estimatedTokens / 1_000_000) * 0.75).toFixed(4)
 
     res.json({
-        status:   'ok',
-        service:  'keymo-proxy',
+        status: 'ok',
+        service: 'keymo-proxy',
         provider: CONFIG.provider,
-        model:    CONFIG.provider === 'anthropic' ? CONFIG.anthropicModel : CONFIG.openaiModel,
-        uptime:   `${uptimeHours}h`,
+        model: CONFIG.provider === 'anthropic' ? CONFIG.anthropicModel : CONFIG.openaiModel,
+        uptime: `${uptimeHours}h`,
         limits: {
             perMinute: CONFIG.minuteLimit,
-            perHour:   CONFIG.hourLimit,
-            perDay:    CONFIG.dayLimit
+            perHour: CONFIG.hourLimit,
+            perDay: CONFIG.dayLimit
         },
         stats: {
-            totalRequests:   stats.totalRequests,
-            cacheHits:       stats.cacheHits,
-            cacheHitRate:    stats.totalRequests > 0
-                             ? `${((stats.cacheHits / stats.totalRequests) * 100).toFixed(1)}%`
-                             : '0%',
+            totalRequests: stats.totalRequests,
+            cacheHits: stats.cacheHits,
+            cacheHitRate: stats.totalRequests > 0 ?
+                `${((stats.cacheHits / stats.totalRequests) * 100).toFixed(1)}%` : '0%',
             rateLimitBlocks: stats.rateLimitBlocks,
-            abuseBlocks:     stats.abuseBlocks,
-            errors:          stats.errors,
+            abuseBlocks: stats.abuseBlocks,
+            errors: stats.errors,
             estimatedTokens: stats.estimatedTokens,
             estimatedCostUSD: `$${estimatedCost}`
         },
         cache: {
-            entries:    responseCache.size,
+            entries: responseCache.size,
             maxEntries: CONFIG.maxCacheEntries,
             ttlMinutes: CONFIG.cacheTTLMinutes
         },
