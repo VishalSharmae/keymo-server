@@ -446,8 +446,8 @@ app.post('/rewrite', async (req, res) => {
     }
 
     const userMessage = messages.find(m => m.role === 'user')?.content || ''
-    let uid = req.body.uid || null
-    const isPro = isUserPro(uid)
+    const userId = req.body.uid || null
+    const isPro = isUserPro(userId)
 
     // ── Abuse check ──────────────────────────────────────────────
     const abuseCheck = checkForAbuse(userMessage)
@@ -465,7 +465,7 @@ app.post('/rewrite', async (req, res) => {
             error: 'Invalid request'
         })
     }
-    const identifier = req.body.uid || ip
+    const identifier = userId || ip
     const maxInput = isPro ? 5000 : 500
     const dailyLim = isPro ? 999999 : 25
 
