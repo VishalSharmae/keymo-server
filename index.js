@@ -21,6 +21,8 @@ const fetch = require('node-fetch')
 const cors = require('cors')
 const crypto = require('crypto')
 const app = express()
+const fs = require('fs')
+const PAID_USERS_FILE = '/tmp/keymo-paid-users.json'
 
 app.use(cors())
 app.use(express.json({
@@ -278,7 +280,6 @@ const ABUSE_PATTERNS = [
     /jailbreak/i,
     /\bDAN\b/,
     /<script[\s\S]*?>/i,
-    /system\s*:/i
 ]
 
 function checkForAbuse(input) {
@@ -306,6 +307,20 @@ function checkForAbuse(input) {
 
 function estimateTokens(text) {
     return Math.ceil((text || '').length / 4)
+}
+
+function logUsageEvent(userId, mode, context, cached) {
+    const event = {
+        ts: new Date().toISOString(),
+        uid: userId, // anonymous local ID from Keychain
+        mode,
+        context,
+        cached,
+        day: new Date().toISOString().split('T')[0]
+    }
+    // Append to a daily log file — simple, no database needed
+    const logFile = `/tmp/keymo-usage-${event.day}.jsonl`
+    fs.appendFileSync(logFile, JSON.stringify(event) + '\n')
 }
 
 // ─── Anthropic Streaming ──────────────────────────────────────────────────────
@@ -446,7 +461,7 @@ app.post('/rewrite', async (req, res) => {
     }
 
     const userMessage = messages.find(m => m.role === 'user')?.content || ''
-    const userId = req.body.uid || null
+    const userId = uid || null
     const isPro = isUserPro(userId)
 
     // ── Abuse check ──────────────────────────────────────────────
@@ -465,13 +480,20 @@ app.post('/rewrite', async (req, res) => {
             error: 'Invalid request'
         })
     }
-    const identifier = userId || ip
+    const identifier = userId ? `uid:${userId}` : `ip:${ip}`
     const maxInput = isPro ? 5000 : 500
     const dailyLim = isPro ? 999999 : 25
 
     // ── Rate limit check ─────────────────────────────────────────
+    let rateCheck = {
+        limited: false,
+        minuteRemaining: '∞',
+        hourRemaining: '∞',
+        dayRemaining: '∞'
+    }
+
     if (!isPro) {
-        const rateCheck = checkRateLimit(identifier)
+        rateCheck = checkRateLimit(identifier)
         if (rateCheck.limited) {
             stats.rateLimitBlocks++
             console.warn(`[rate-limit] ${ip} | ${rateCheck.window}: ${rateCheck.message}`)
@@ -555,23 +577,8 @@ app.post('/rewrite', async (req, res) => {
             console.log(`[complete] ${ip} | ~${outputTokens} output tokens | cache: ${responseCache.size} entries`)
         }
 
+        logUsageEvent(userId, 'rewrite', provider, !!cached)
         res.end()
-
-        const fs = require('fs')
-
-        function logUsageEvent(userId, mode, context, cached) {
-            const event = {
-                ts: new Date().toISOString(),
-                uid: userId, // anonymous local ID from Keychain
-                mode,
-                context,
-                cached,
-                day: new Date().toISOString().split('T')[0]
-            }
-            // Append to a daily log file — simple, no database needed
-            const logFile = `/tmp/keymo-usage-${event.day}.jsonl`
-            fs.appendFileSync(logFile, JSON.stringify(event) + '\n')
-        }
 
     } catch (error) {
         stats.errors++
