@@ -635,55 +635,101 @@ app.get('/stats/:password', (req, res) => {
 })
 
 // ─── /webhook/payment - Webhook endpoint — called by LemonSqueezy on payment ──────────────────────────────────────────────────────────────────
-app.post('/webhook/payment', (req, res) => {
-    const event = req.body
+
+app.post('/webhook/payment', express.raw({
+    type: 'application/json'
+}), (req, res) => {
+
+    // ── Signature Verification ────────────────────────────────────
+    // Lemon Squeezy signs every webhook with HMAC-SHA256
+    // We verify it to make sure the request is genuinely from them
+    // and not from someone trying to fake a payment
+    const secret = process.env.WEBHOOK_SECRET
+    const signature = req.headers['x-signature']
+
+    if (!secret) {
+        console.error('[webhook] ⚠️  WEBHOOK_SECRET not set — rejecting all webhooks')
+        return res.status(500).json({
+            error: 'Webhook secret not configured'
+        })
+    }
+
+    if (!signature) {
+        console.warn('[webhook] ❌ No signature header — rejecting')
+        return res.status(401).json({
+            error: 'Missing signature'
+        })
+    }
+
+    // Compute expected signature from raw request body
+    const hmac = crypto.createHmac('sha256', secret)
+    const digest = hmac.update(req.body).digest('hex')
+
+    // Constant-time comparison — prevents timing attacks
+    const trusted = Buffer.from(digest, 'hex')
+    const received = Buffer.from(signature, 'hex')
+
+    if (trusted.length !== received.length ||
+        !crypto.timingSafeEqual(trusted, received)) {
+        console.warn('[webhook] ❌ Invalid signature — rejecting')
+        return res.status(401).json({
+            error: 'Invalid signature'
+        })
+    }
+
+    // ── Parse Body ────────────────────────────────────────────────
+    // Body is raw buffer at this point — parse it to JSON now
+    let event
+    try {
+        event = JSON.parse(req.body.toString())
+    } catch (e) {
+        console.error('[webhook] ❌ Could not parse body:', e.message)
+        return res.status(400).json({
+            error: 'Invalid JSON'
+        })
+    }
+
     const eventName = event.meta?.event_name
     const uid = event.meta?.custom_data?.uid
 
-    console.log(`[webhook] Event: ${eventName}, uid: ${uid?.substring(0, 8)}...`)
+    console.log(`[webhook] ✅ Verified | Event: ${eventName} | uid: ${uid?.substring(0, 8) ?? 'none'}...`)
 
-    // ── New subscription created ──────────────────────────────
+    // ── New subscription created ──────────────────────────────────
     if (eventName === 'subscription_created') {
         if (uid) {
-            // Set expiry to 35 days from now
-            // (31 days billing + 4 days grace period for payment retries)
             const expiresAt = Date.now() + (35 * 24 * 60 * 60 * 1000)
             paidUsers.set(uid, expiresAt)
             savePaidUsers()
-            console.log(`[payment] Pro granted until: ${new Date(expiresAt).toISOString()}`)
+            console.log(`[payment] ✅ Pro granted until: ${new Date(expiresAt).toISOString()}`)
+        } else {
+            console.warn('[webhook] subscription_created — no uid in custom_data')
         }
     }
 
-    // ── Subscription renewed (monthly payment succeeded) ──────
+    // ── Subscription renewed ──────────────────────────────────────
     if (eventName === 'subscription_payment_success') {
         if (uid) {
-            // Extend by another 35 days from now
             const expiresAt = Date.now() + (35 * 24 * 60 * 60 * 1000)
             paidUsers.set(uid, expiresAt)
             savePaidUsers()
-            console.log(`[payment] Pro renewed until: ${new Date(expiresAt).toISOString()}`)
+            console.log(`[payment] ✅ Pro renewed until: ${new Date(expiresAt).toISOString()}`)
         }
     }
 
-    // ── Subscription cancelled ────────────────────────────────
-    // IMPORTANT: Do NOT remove user immediately.
-    // They paid for the current period — honour it.
-    // Lemon Squeezy also sends the period end date in the event.
+    // ── Subscription cancelled ────────────────────────────────────
+    // Honour the remaining paid period — do NOT revoke immediately
     if (eventName === 'subscription_cancelled') {
         if (uid) {
-            // Get the period end date from Lemon Squeezy's event
-            // This is when they actually lose access
             const endsAt = event.data?.attributes?.ends_at ||
                 event.data?.attributes?.renews_at
 
             if (endsAt) {
-                // Set expiry to their actual period end date
                 const expiresAt = new Date(endsAt).getTime()
                 paidUsers.set(uid, expiresAt)
                 savePaidUsers()
                 console.log(`[payment] Cancelled — pro until: ${endsAt}`)
             } else {
-                // Fallback: give 30 more days if we can't parse the date
+                // Fallback — give 30 days if period end date missing
                 const expiresAt = Date.now() + (30 * 24 * 60 * 60 * 1000)
                 paidUsers.set(uid, expiresAt)
                 savePaidUsers()
@@ -692,29 +738,30 @@ app.post('/webhook/payment', (req, res) => {
         }
     }
 
-    // ── Subscription fully expired ────────────────────────────
-    // This fires AFTER the period ends — safe to revoke now
+    // ── Subscription fully expired ────────────────────────────────
+    // Period has ended — safe to revoke access now
     if (eventName === 'subscription_expired') {
         if (uid) {
             paidUsers.delete(uid)
             savePaidUsers()
-            console.log(`[payment] Pro expired — revoked: ${uid?.substring(0, 8)}...`)
+            console.log(`[payment] Expired — pro revoked: ${uid?.substring(0, 8)}...`)
         }
     }
 
-    // ── Payment failed after all retries ─────────────────────
+    // ── Payment failed after all retries ──────────────────────────
     if (eventName === 'subscription_payment_failed') {
         if (uid) {
-            // Give a 3 day grace period to update payment details
+            // 3 day grace period to update card details
             const expiresAt = Date.now() + (3 * 24 * 60 * 60 * 1000)
             paidUsers.set(uid, expiresAt)
             savePaidUsers()
-            console.log(`[payment] Payment failed — 3 day grace: ${uid?.substring(0, 8)}...`)
+            console.log(`[payment] Failed — 3 day grace: ${uid?.substring(0, 8)}...`)
         }
     }
 
     res.sendStatus(200)
 })
+
 
 // ─── /make-pro ──────────────────────────────────────────────────────────────────
 app.post('/admin/make-pro', (req, res) => {
@@ -742,6 +789,24 @@ app.get('/pro-status', (req, res) => {
         isPro,
         // Tell the app when access expires so it can show the user
         expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null
+    })
+})
+
+// ─── /checkout lemon squeezy ──────────────────────────────────────────────────────────────────
+
+app.get('/checkout-url', (req, res) => {
+    const uid = req.query.uid || ''
+    const baseURL = process.env.LEMON_CHECKOUT_URL || ''
+
+    if (!baseURL) {
+        return res.status(503).json({
+            error: 'Checkout not configured'
+        })
+    }
+
+    const checkoutURL = `${baseURL}?checkout[custom][uid]=${uid}`
+    res.json({
+        url: checkoutURL
     })
 })
 
