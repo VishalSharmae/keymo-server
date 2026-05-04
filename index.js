@@ -549,9 +549,14 @@ app.post('/rewrite', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
     res.setHeader('X-Cache', 'MISS')
-    res.setHeader('X-Minute-Remaining', rateCheck.minuteRemaining)
-    res.setHeader('X-Hour-Remaining', rateCheck.hourRemaining)
-    res.setHeader('X-Day-Remaining', rateCheck.dayRemaining)
+    
+    if(!isPro){
+        res.setHeader('X-Minute-Remaining', rateCheck.minuteRemaining)
+        res.setHeader('X-Hour-Remaining', rateCheck.hourRemaining)
+        res.setHeader('X-Day-Remaining', rateCheck.dayRemaining)
+    } else {
+        res.setHeader('X-Plan', 'pro')
+    }
 
     // ── Stream from provider ─────────────────────────────────────
     try {
@@ -789,6 +794,40 @@ app.get('/pro-status', (req, res) => {
         isPro,
         // Tell the app when access expires so it can show the user
         expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null
+    })
+})
+
+// ─── /get all pro users──────────────────────────────────────────────────────────────────
+
+app.get('/debug/users', (req, res) => {
+    res.json(Object.fromEntries(paidUsers))
+})
+
+// ─── /remove-pro ───────────────────────────────────────────────────────────────
+app.post('/admin/remove-pro', (req, res) => {
+    const { uid, password } = req.body
+
+    if (password !== process.env.ADMIN_PASSWORD) {
+        return res.status(403).json({ error: 'no' })
+    }
+
+    if (!uid) {
+        return res.status(400).json({ error: 'uid_required' })
+    }
+
+    if (!paidUsers.has(uid)) {
+        return res.status(404).json({ error: 'user_not_found' })
+    }
+
+    paidUsers.delete(uid)
+    savePaidUsers()
+
+    console.log(`[admin] Removed pro access for uid: ${uid.substring(0, 8)}...`)
+
+    res.json({
+        success: true,
+        message: 'Pro access removed',
+        remainingProUsers: paidUsers.size
     })
 })
 
