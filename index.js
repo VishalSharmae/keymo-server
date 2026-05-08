@@ -22,7 +22,8 @@ const cors = require('cors')
 const crypto = require('crypto')
 const app = express()
 const fs = require('fs')
-const PAID_USERS_FILE = '/tmp/keymo-paid-users.json'
+const PAID_USERS_FILE = process.env.PAID_USERS_FILE || '/data/keymo-paid-users.json'
+fs.mkdirSync(require('path').dirname(PAID_USERS_FILE), { recursive: true })
 
 app.use(cors())
 app.use(express.json({
@@ -309,18 +310,38 @@ function estimateTokens(text) {
     return Math.ceil((text || '').length / 4)
 }
 
-function logUsageEvent(userId, mode, context, cached) {
-    const event = {
-        ts: new Date().toISOString(),
-        uid: userId, // anonymous local ID from Keychain
-        mode,
-        context,
-        cached,
-        day: new Date().toISOString().split('T')[0]
-    }
-    // Append to a daily log file — simple, no database needed
-    const logFile = `/tmp/keymo-usage-${event.day}.jsonl`
-    fs.appendFileSync(logFile, JSON.stringify(event) + '\n')
+// ─── Analytics ────────────────────────────────────────────────────────────────
+// All events written to a daily JSONL file on persistent volume.
+// Async + buffered so the request path is never blocked.
+
+const ANALYTICS_DIR = process.env.ANALYTICS_DIR || '/data/analytics'
+fs.mkdirSync(ANALYTICS_DIR, { recursive: true })
+
+let eventBuffer = []
+const FLUSH_INTERVAL_MS = 5000      // flush every 5s
+const FLUSH_MAX_EVENTS  = 50        // or when buffer hits 50 events
+
+function flushEvents() {
+    if (eventBuffer.length === 0) return
+    const today = new Date().toISOString().split('T')[0]
+    const file  = `${ANALYTICS_DIR}/usage-${today}.jsonl`
+    const lines = eventBuffer.map(e => JSON.stringify(e)).join('\n') + '\n'
+    eventBuffer = []
+    fs.appendFile(file, lines, err => {
+        if (err) console.error('[analytics] flush failed:', err.message)
+    })
+}
+
+setInterval(flushEvents, FLUSH_INTERVAL_MS)
+process.on('SIGTERM', flushEvents)   // flush before Railway redeploys
+
+function logEvent(event) {
+    eventBuffer.push({
+        ts:  Date.now(),
+        day: new Date().toISOString().split('T')[0],
+        ...event
+    })
+    if (eventBuffer.length >= FLUSH_MAX_EVENTS) flushEvents()
 }
 
 // ─── Anthropic Streaming ──────────────────────────────────────────────────────
@@ -438,19 +459,16 @@ app.post('/rewrite', async (req, res) => {
     stats.totalRequests++
 
     // Get real IP (Railway sits behind a proxy)
-    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-        req.socket.remoteAddress ||
-        'unknown'
+    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim()
+               || req.socket.remoteAddress || 'unknown'
 
     const {
-        messages,
-        system,
+        messages, system,
         provider: requestedProvider,
-        temperature,
-        max_tokens,
-        stop_sequences,
-        isRetry,
-        uid
+        temperature, max_tokens, stop_sequences,
+        isRetry, uid,
+        mode    = 'unknown',     // ← capture from app
+        context = 'unknown'       // ← capture from app
     } = req.body
 
     // ── Validate request body ────────────────────────────────────
@@ -495,9 +513,13 @@ app.post('/rewrite', async (req, res) => {
     if (!isPro) {
         rateCheck = checkRateLimit(identifier)
         if (rateCheck.limited) {
-            stats.rateLimitBlocks++
-            console.warn(`[rate-limit] ${ip} | ${rateCheck.window}: ${rateCheck.message}`)
-
+        stats.rateLimitBlocks++
+        logEvent({
+            type: 'rate_limited',
+            uid, mode, context,
+            window: rateCheck.window,
+            isPro
+        })
             return res.status(429).json({
                 error: 'rate_limited',
                 window: rateCheck.window, // 'minute' | 'hour' | 'day'
@@ -528,7 +550,17 @@ app.post('/rewrite', async (req, res) => {
 
     if (cached) {
         stats.cacheHits++
-        console.log(`[cache-hit] ${ip}`)
+        logEvent({
+            type: 'rewrite',
+            uid, mode, context,
+            cached:    true,
+            isRetry:   !!isRetry,
+            isPro,
+            provider:  requestedProvider || CONFIG.provider,
+            latencyMs: Date.now() - startedAt,
+            inputChars:  userMessage.length,
+            outputChars: cached.length
+        })
         // Return as SSE so app streaming code works unchanged
         res.setHeader('Content-Type', 'text/event-stream')
         res.setHeader('Cache-Control', 'no-cache')
@@ -582,12 +614,31 @@ app.post('/rewrite', async (req, res) => {
             console.log(`[complete] ${ip} | ~${outputTokens} output tokens | cache: ${responseCache.size} entries`)
         }
 
-        logUsageEvent(userId, 'rewrite', provider, !!cached)
+        logEvent({
+            type: 'rewrite',
+            uid, mode, context,
+            cached:    false,
+            isRetry:   !!isRetry,
+            isPro,
+            provider,
+            latencyMs:   Date.now() - startedAt,
+            inputChars:  userMessage.length,
+            outputChars: fullText.length,
+            inputTokens,
+            outputTokens: estimateTokens(fullText)
+        })
         res.end()
 
     } catch (error) {
         stats.errors++
         console.error(`[error] ${ip}: ${error.message}`)
+        logEvent({
+            type:    'error',
+            uid, mode, context,
+            isPro,
+            provider: requestedProvider || CONFIG.provider,
+            message:  error.message?.slice(0, 200)
+        })
         if (!res.headersSent) {
             res.status(500).json({
                 error: 'AI provider error. Please try again.'
@@ -598,44 +649,99 @@ app.post('/rewrite', async (req, res) => {
     }
 })
 
-// ─── /stats ──────────────────────────────────────────────────────────────────
+// ─── /stats ───────────────────────────────────────────────────────────────────
+// Auth via header, not URL (URLs leak into logs).
+// Query params:
+//   ?days=7   how many days of history (default 1, max 30)
 
-app.get('/stats/:password', (req, res) => {
-    if (req.params.password !== process.env.STATS_PASSWORD) {
-        return res.status(403).json({
-            error: 'nope'
-        })
+app.get('/stats', (req, res) => {
+    if (req.headers['x-admin-password'] !== process.env.STATS_PASSWORD) {
+        return res.status(403).json({ error: 'forbidden' })
     }
 
-    const today = new Date().toISOString().split('T')[0]
-    const logFile = `/tmp/keymo-usage-${today}.jsonl`
+    flushEvents()  // make sure latest events are on disk
 
-    if (!fs.existsSync(logFile)) {
-        return res.json({
-            today: 0,
-            uniqueUsers: 0,
-            topMode: 'none'
-        })
+    const days = Math.min(parseInt(req.query.days) || 1, 30)
+    const events = []
+
+    for (let i = 0; i < days; i++) {
+        const d    = new Date(Date.now() - i * 86400000).toISOString().split('T')[0]
+        const file = `${ANALYTICS_DIR}/usage-${d}.jsonl`
+        if (!fs.existsSync(file)) continue
+        const lines = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+        for (const l of lines) {
+            try { events.push(JSON.parse(l)) } catch {}
+        }
     }
 
-    const lines = fs.readFileSync(logFile, 'utf8')
-        .trim().split('\n').filter(Boolean)
-        .map(l => JSON.parse(l))
+    const rewrites = events.filter(e => e.type === 'rewrite')
+    const errors   = events.filter(e => e.type === 'error')
+    const limited  = events.filter(e => e.type === 'rate_limited')
+    const cached   = rewrites.filter(e => e.cached)
+    const retried  = rewrites.filter(e => e.isRetry)
 
-    const uniqueUsers = new Set(lines.map(l => l.uid)).size
-    const modes = lines.reduce((acc, l) => {
-        acc[l.mode] = (acc[l.mode] || 0) + 1
+    const tally = (arr, key) => arr.reduce((acc, e) => {
+        const k = e[key] || 'unknown'
+        acc[k] = (acc[k] || 0) + 1
         return acc
     }, {})
-    const topMode = Object.entries(modes)
-        .sort((a, b) => b[1] - a[1])[0]?.[0]
+
+    const uniqueUsers = new Set(rewrites.map(e => e.uid).filter(Boolean)).size
+    const dau = {}
+    for (const e of rewrites) {
+        dau[e.day] = dau[e.day] || new Set()
+        if (e.uid) dau[e.day].add(e.uid)
+    }
+    const dauSeries = Object.fromEntries(
+        Object.entries(dau).map(([d, s]) => [d, s.size])
+    )
+
+    const latencies = rewrites
+        .filter(e => !e.cached && typeof e.latencyMs === 'number')
+        .map(e => e.latencyMs)
+        .sort((a, b) => a - b)
+    const p50 = latencies[Math.floor(latencies.length * 0.5)] || 0
+    const p95 = latencies[Math.floor(latencies.length * 0.95)] || 0
+
+    const totalInputTokens  = rewrites.reduce((s, e) => s + (e.inputTokens  || 0), 0)
+    const totalOutputTokens = rewrites.reduce((s, e) => s + (e.outputTokens || 0), 0)
+    // Haiku: $0.25/M input + $1.25/M output
+    const costUSD = (totalInputTokens * 0.25 + totalOutputTokens * 1.25) / 1_000_000
 
     res.json({
-        today: lines.length,
-        uniqueUsers,
-        topMode,
-        cacheHitRate: `${((lines.filter(l => l.cached).length / lines.length) * 100).toFixed(1)}%`,
-        modes
+        windowDays: days,
+        totals: {
+            rewrites:    rewrites.length,
+            errors:      errors.length,
+            rateLimited: limited.length,
+            cacheHits:   cached.length,
+            retries:     retried.length,
+            cacheHitRate: rewrites.length
+                ? `${(cached.length / rewrites.length * 100).toFixed(1)}%` : '0%',
+            retryRate: rewrites.length
+                ? `${(retried.length / rewrites.length * 100).toFixed(1)}%` : '0%',
+            errorRate: events.length
+                ? `${(errors.length / events.length * 100).toFixed(2)}%` : '0%'
+        },
+        users: {
+            uniqueUsers,
+            proUsers:        paidUsers.size,
+            dailyActive:     dauSeries,
+            avgRewritesPerUser: uniqueUsers
+                ? (rewrites.length / uniqueUsers).toFixed(1) : '0'
+        },
+        latencyMs: { p50, p95 },
+        breakdown: {
+            byMode:     tally(rewrites, 'mode'),
+            byContext:  tally(rewrites, 'context'),
+            byProvider: tally(rewrites, 'provider'),
+            rateLimitsByWindow: tally(limited, 'window')
+        },
+        cost: {
+            inputTokens:  totalInputTokens,
+            outputTokens: totalOutputTokens,
+            estimatedUSD: `$${costUSD.toFixed(4)}`
+        }
     })
 })
 
