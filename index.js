@@ -23,7 +23,9 @@ const crypto = require('crypto')
 const app = express()
 const fs = require('fs')
 const PAID_USERS_FILE = process.env.PAID_USERS_FILE || '/data/keymo-paid-users.json'
-fs.mkdirSync(require('path').dirname(PAID_USERS_FILE), { recursive: true })
+fs.mkdirSync(require('path').dirname(PAID_USERS_FILE), {
+    recursive: true
+})
 
 app.use(cors())
 app.use(express.json({
@@ -62,6 +64,9 @@ const CONFIG = {
     // Upgrade message shown when any limit is hit
     upgradeMessage: process.env.UPGRADE_MESSAGE ||
         'Get unlimited rewrites with Keymo Pro — $5/month.',
+
+    maxInputFree: parseInt(process.env.MAX_INPUT_FREE) || 1000,
+    maxInputPro: parseInt(process.env.MAX_INPUT_PRO) || 10000,
 
     port: parseInt(process.env.PORT) || 3000
 }
@@ -315,16 +320,18 @@ function estimateTokens(text) {
 // Async + buffered so the request path is never blocked.
 
 const ANALYTICS_DIR = process.env.ANALYTICS_DIR || '/data/analytics'
-fs.mkdirSync(ANALYTICS_DIR, { recursive: true })
+fs.mkdirSync(ANALYTICS_DIR, {
+    recursive: true
+})
 
 let eventBuffer = []
-const FLUSH_INTERVAL_MS = 5000      // flush every 5s
-const FLUSH_MAX_EVENTS  = 50        // or when buffer hits 50 events
+const FLUSH_INTERVAL_MS = 5000 // flush every 5s
+const FLUSH_MAX_EVENTS = 50 // or when buffer hits 50 events
 
 function flushEvents() {
     if (eventBuffer.length === 0) return
     const today = new Date().toISOString().split('T')[0]
-    const file  = `${ANALYTICS_DIR}/usage-${today}.jsonl`
+    const file = `${ANALYTICS_DIR}/usage-${today}.jsonl`
     const lines = eventBuffer.map(e => JSON.stringify(e)).join('\n') + '\n'
     eventBuffer = []
     fs.appendFile(file, lines, err => {
@@ -333,11 +340,11 @@ function flushEvents() {
 }
 
 setInterval(flushEvents, FLUSH_INTERVAL_MS)
-process.on('SIGTERM', flushEvents)   // flush before Railway redeploys
+process.on('SIGTERM', flushEvents) // flush before Railway redeploys
 
 function logEvent(event) {
     eventBuffer.push({
-        ts:  Date.now(),
+        ts: Date.now(),
         day: new Date().toISOString().split('T')[0],
         ...event
     })
@@ -459,16 +466,20 @@ app.post('/rewrite', async (req, res) => {
     stats.totalRequests++
 
     // Get real IP (Railway sits behind a proxy)
-    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim()
-               || req.socket.remoteAddress || 'unknown'
+    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+        req.socket.remoteAddress || 'unknown'
 
     const {
-        messages, system,
+        messages,
+        system,
         provider: requestedProvider,
-        temperature, max_tokens, stop_sequences,
-        isRetry, uid,
-        mode    = 'unknown',     // ← capture from app
-        context = 'unknown'       // ← capture from app
+        temperature,
+        max_tokens,
+        stop_sequences,
+        isRetry,
+        uid,
+        mode = 'unknown', // ← capture from app
+        context = 'unknown' // ← capture from app
     } = req.body
 
     // ── Validate request body ────────────────────────────────────
@@ -499,8 +510,7 @@ app.post('/rewrite', async (req, res) => {
         })
     }
     const identifier = userId ? `uid:${userId}` : `ip:${ip}`
-    maxInputFree: parseInt(process.env.MAX_INPUT_FREE) || 1000,
-    maxInputPro:  parseInt(process.env.MAX_INPUT_PRO)  || 10000,
+    const maxInput = isPro ? CONFIG.maxInputPro : CONFIG.maxInputFree
 
     // ── Rate limit check ─────────────────────────────────────────
     let rateCheck = {
@@ -513,13 +523,15 @@ app.post('/rewrite', async (req, res) => {
     if (!isPro) {
         rateCheck = checkRateLimit(identifier)
         if (rateCheck.limited) {
-        stats.rateLimitBlocks++
-        logEvent({
-            type: 'rate_limited',
-            uid, mode, context,
-            window: rateCheck.window,
-            isPro
-        })
+            stats.rateLimitBlocks++
+            logEvent({
+                type: 'rate_limited',
+                uid,
+                mode,
+                context,
+                window: rateCheck.window,
+                isPro
+            })
             return res.status(429).json({
                 error: 'rate_limited',
                 window: rateCheck.window, // 'minute' | 'hour' | 'day'
@@ -530,17 +542,21 @@ app.post('/rewrite', async (req, res) => {
             })
         }
     }
+    const maxProInput = CONFIG.maxInputPro
 
     // ── Message limit check ─────────────────────────────────────────
     if (userMessage.length > maxInput) {
         return res.status(400).json({
             error: 'input_too_long',
-            message: `Your input is ${userMessage.length} characters. ${isPro ? 
-            `Keymo Pro supports up to ${maxInput} characters.` : 
-            `Free tier supports up to ${maxInput} characters.`}`,
+            message: `Your input is ${userMessage.length} characters. ${
+            isPro
+                ? `Keymo Pro supports up to ${maxProInput} characters.`
+                : `Free tier supports up to ${maxInput} characters.`
+        }`,
             upgrade: isPro ?
-                undefined : 'Upgrade to Keymo Pro — $5/month for up to 10,000 characters.'
-        });
+                undefined :
+                `Upgrade to Keymo Pro — $5/month for up to ${maxProInput} characters.`
+        })
     }
 
     // ── Cache check ──────────────────────────────────────────────
@@ -552,13 +568,15 @@ app.post('/rewrite', async (req, res) => {
         stats.cacheHits++
         logEvent({
             type: 'rewrite',
-            uid, mode, context,
-            cached:    true,
-            isRetry:   !!isRetry,
+            uid,
+            mode,
+            context,
+            cached: true,
+            isRetry: !!isRetry,
             isPro,
-            provider:  requestedProvider || CONFIG.provider,
+            provider: requestedProvider || CONFIG.provider,
             latencyMs: Date.now() - startedAt,
-            inputChars:  userMessage.length,
+            inputChars: userMessage.length,
             outputChars: cached.length
         })
         // Return as SSE so app streaming code works unchanged
@@ -581,8 +599,8 @@ app.post('/rewrite', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
     res.setHeader('X-Cache', 'MISS')
-    
-    if(!isPro){
+
+    if (!isPro) {
         res.setHeader('X-Minute-Remaining', rateCheck.minuteRemaining)
         res.setHeader('X-Hour-Remaining', rateCheck.hourRemaining)
         res.setHeader('X-Day-Remaining', rateCheck.dayRemaining)
@@ -616,13 +634,15 @@ app.post('/rewrite', async (req, res) => {
 
         logEvent({
             type: 'rewrite',
-            uid, mode, context,
-            cached:    false,
-            isRetry:   !!isRetry,
+            uid,
+            mode,
+            context,
+            cached: false,
+            isRetry: !!isRetry,
             isPro,
             provider,
-            latencyMs:   Date.now() - startedAt,
-            inputChars:  userMessage.length,
+            latencyMs: Date.now() - startedAt,
+            inputChars: userMessage.length,
             outputChars: fullText.length,
             inputTokens,
             outputTokens: estimateTokens(fullText)
@@ -633,11 +653,13 @@ app.post('/rewrite', async (req, res) => {
         stats.errors++
         console.error(`[error] ${ip}: ${error.message}`)
         logEvent({
-            type:    'error',
-            uid, mode, context,
+            type: 'error',
+            uid,
+            mode,
+            context,
             isPro,
             provider: requestedProvider || CONFIG.provider,
-            message:  error.message?.slice(0, 200)
+            message: error.message?.slice(0, 200)
         })
         if (!res.headersSent) {
             res.status(500).json({
@@ -656,29 +678,33 @@ app.post('/rewrite', async (req, res) => {
 
 app.get('/stats', (req, res) => {
     if (req.headers['x-admin-password'] !== process.env.STATS_PASSWORD) {
-        return res.status(403).json({ error: 'forbidden' })
+        return res.status(403).json({
+            error: 'forbidden'
+        })
     }
 
-    flushEvents()  // make sure latest events are on disk
+    flushEvents() // make sure latest events are on disk
 
     const days = Math.min(parseInt(req.query.days) || 1, 30)
     const events = []
 
     for (let i = 0; i < days; i++) {
-        const d    = new Date(Date.now() - i * 86400000).toISOString().split('T')[0]
+        const d = new Date(Date.now() - i * 86400000).toISOString().split('T')[0]
         const file = `${ANALYTICS_DIR}/usage-${d}.jsonl`
         if (!fs.existsSync(file)) continue
         const lines = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
         for (const l of lines) {
-            try { events.push(JSON.parse(l)) } catch {}
+            try {
+                events.push(JSON.parse(l))
+            } catch {}
         }
     }
 
     const rewrites = events.filter(e => e.type === 'rewrite')
-    const errors   = events.filter(e => e.type === 'error')
-    const limited  = events.filter(e => e.type === 'rate_limited')
-    const cached   = rewrites.filter(e => e.cached)
-    const retried  = rewrites.filter(e => e.isRetry)
+    const errors = events.filter(e => e.type === 'error')
+    const limited = events.filter(e => e.type === 'rate_limited')
+    const cached = rewrites.filter(e => e.cached)
+    const retried = rewrites.filter(e => e.isRetry)
 
     const tally = (arr, key) => arr.reduce((acc, e) => {
         const k = e[key] || 'unknown'
@@ -703,7 +729,7 @@ app.get('/stats', (req, res) => {
     const p50 = latencies[Math.floor(latencies.length * 0.5)] || 0
     const p95 = latencies[Math.floor(latencies.length * 0.95)] || 0
 
-    const totalInputTokens  = rewrites.reduce((s, e) => s + (e.inputTokens  || 0), 0)
+    const totalInputTokens = rewrites.reduce((s, e) => s + (e.inputTokens || 0), 0)
     const totalOutputTokens = rewrites.reduce((s, e) => s + (e.outputTokens || 0), 0)
     // Haiku: $0.25/M input + $1.25/M output
     const costUSD = (totalInputTokens * 0.25 + totalOutputTokens * 1.25) / 1_000_000
@@ -711,34 +737,37 @@ app.get('/stats', (req, res) => {
     res.json({
         windowDays: days,
         totals: {
-            rewrites:    rewrites.length,
-            errors:      errors.length,
+            rewrites: rewrites.length,
+            errors: errors.length,
             rateLimited: limited.length,
-            cacheHits:   cached.length,
-            retries:     retried.length,
-            cacheHitRate: rewrites.length
-                ? `${(cached.length / rewrites.length * 100).toFixed(1)}%` : '0%',
-            retryRate: rewrites.length
-                ? `${(retried.length / rewrites.length * 100).toFixed(1)}%` : '0%',
-            errorRate: events.length
-                ? `${(errors.length / events.length * 100).toFixed(2)}%` : '0%'
+            cacheHits: cached.length,
+            retries: retried.length,
+            cacheHitRate: rewrites.length ?
+                `${(cached.length / rewrites.length * 100).toFixed(1)}%` : '0%',
+            retryRate: rewrites.length ?
+                `${(retried.length / rewrites.length * 100).toFixed(1)}%` : '0%',
+            errorRate: events.length ?
+                `${(errors.length / events.length * 100).toFixed(2)}%` : '0%'
         },
         users: {
             uniqueUsers,
-            proUsers:        paidUsers.size,
-            dailyActive:     dauSeries,
-            avgRewritesPerUser: uniqueUsers
-                ? (rewrites.length / uniqueUsers).toFixed(1) : '0'
+            proUsers: paidUsers.size,
+            dailyActive: dauSeries,
+            avgRewritesPerUser: uniqueUsers ?
+                (rewrites.length / uniqueUsers).toFixed(1) : '0'
         },
-        latencyMs: { p50, p95 },
+        latencyMs: {
+            p50,
+            p95
+        },
         breakdown: {
-            byMode:     tally(rewrites, 'mode'),
-            byContext:  tally(rewrites, 'context'),
+            byMode: tally(rewrites, 'mode'),
+            byContext: tally(rewrites, 'context'),
             byProvider: tally(rewrites, 'provider'),
             rateLimitsByWindow: tally(limited, 'window')
         },
         cost: {
-            inputTokens:  totalInputTokens,
+            inputTokens: totalInputTokens,
             outputTokens: totalOutputTokens,
             estimatedUSD: `$${costUSD.toFixed(4)}`
         }
@@ -995,18 +1024,27 @@ app.get('/debug/users', (req, res) => {
 
 // ─── /remove-pro ───────────────────────────────────────────────────────────────
 app.post('/admin/remove-pro', (req, res) => {
-    const { uid, password } = req.body
+    const {
+        uid,
+        password
+    } = req.body
 
     if (password !== process.env.ADMIN_PASSWORD) {
-        return res.status(403).json({ error: 'no' })
+        return res.status(403).json({
+            error: 'no'
+        })
     }
 
     if (!uid) {
-        return res.status(400).json({ error: 'uid_required' })
+        return res.status(400).json({
+            error: 'uid_required'
+        })
     }
 
     if (!paidUsers.has(uid)) {
-        return res.status(404).json({ error: 'user_not_found' })
+        return res.status(404).json({
+            error: 'user_not_found'
+        })
     }
 
     paidUsers.delete(uid)
