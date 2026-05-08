@@ -499,8 +499,8 @@ app.post('/rewrite', async (req, res) => {
         })
     }
     const identifier = userId ? `uid:${userId}` : `ip:${ip}`
-    const maxInput = isPro ? 5000 : 500
-    const dailyLim = isPro ? 999999 : 25
+    maxInputFree: parseInt(process.env.MAX_INPUT_FREE) || 1000,
+    maxInputPro:  parseInt(process.env.MAX_INPUT_PRO)  || 10000,
 
     // ── Rate limit check ─────────────────────────────────────────
     let rateCheck = {
@@ -539,7 +539,7 @@ app.post('/rewrite', async (req, res) => {
             `Keymo Pro supports up to ${maxInput} characters.` : 
             `Free tier supports up to ${maxInput} characters.`}`,
             upgrade: isPro ?
-                undefined : 'Upgrade to Keymo Pro — $5/month for up to 5,000 characters.'
+                undefined : 'Upgrade to Keymo Pro — $5/month for up to 10,000 characters.'
         });
     }
 
