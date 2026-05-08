@@ -745,6 +745,90 @@ app.get('/stats', (req, res) => {
     })
 })
 
+//---- /dashboard -------------------------------------------------------------------------------------------------------------------------------
+
+app.get('/dashboard', (req, res) => {
+    res.type('html').send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Keymo Analytics</title>
+<style>
+    body { font: 14px -apple-system, sans-serif; max-width: 1100px; margin: 30px auto;
+           padding: 0 20px; background: #0e0e10; color: #e8e8ea; }
+    h1 { font-weight: 600; }
+    h2 { font-weight: 500; color: #f6e0a3; margin-top: 28px; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    input { background: #1a1a1d; border: 1px solid #333; color: #fff; padding: 6px 10px; border-radius: 6px; }
+    button { background: #f6e0a3; color: #000; border: 0; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 14px 0; }
+    .card { background: #16161a; padding: 14px; border-radius: 10px; border: 1px solid #26262b; }
+    .card .v { font-size: 22px; font-weight: 600; }
+    .card .l { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+    table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+    th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #26262b; }
+    th { color: #888; font-weight: 500; font-size: 12px; }
+    pre { background: #16161a; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>📊 Keymo Analytics</h1>
+
+<div>
+    <input id="pw" type="password" placeholder="Admin password">
+    <input id="days" type="number" value="7" min="1" max="30" style="width:60px">
+    <button onclick="load()">Load</button>
+</div>
+
+<div id="out" style="margin-top:20px;color:#888">Enter password and click Load.</div>
+
+<script>
+async function load() {
+    const pw   = document.getElementById('pw').value
+    const days = document.getElementById('days').value
+    const out  = document.getElementById('out')
+    out.textContent = 'Loading…'
+
+    const r = await fetch('/stats?days=' + days, {
+        headers: { 'x-admin-password': pw }
+    })
+    if (!r.ok) { out.textContent = 'Auth failed'; return }
+    const d = await r.json()
+
+    const card = (l, v) => \`<div class="card"><div class="l">\${l}</div><div class="v">\${v}</div></div>\`
+    const tbl  = (obj) => {
+        const rows = Object.entries(obj).sort((a,b) => b[1]-a[1])
+            .map(([k,v]) => \`<tr><td>\${k}</td><td>\${v}</td></tr>\`).join('')
+        return \`<table><tr><th>Key</th><th>Count</th></tr>\${rows}</table>\`
+    }
+
+    out.innerHTML = \`
+        <h2>Overview (\${d.windowDays}-day window)</h2>
+        <div class="grid">
+            \${card('Rewrites',      d.totals.rewrites)}
+            \${card('Unique users',  d.users.uniqueUsers)}
+            \${card('Pro users',     d.users.proUsers)}
+            \${card('Cache hit rate',d.totals.cacheHitRate)}
+            \${card('Retry rate',    d.totals.retryRate)}
+            \${card('Error rate',    d.totals.errorRate)}
+            \${card('Rate-limited',  d.totals.rateLimited)}
+            \${card('Avg / user',    d.users.avgRewritesPerUser)}
+            \${card('p50 latency',   d.latencyMs.p50 + ' ms')}
+            \${card('p95 latency',   d.latencyMs.p95 + ' ms')}
+            \${card('Est. cost',     d.cost.estimatedUSD)}
+            \${card('Output tokens', d.cost.outputTokens.toLocaleString())}
+        </div>
+
+        <h2>By Mode</h2>          \${tbl(d.breakdown.byMode)}
+        <h2>By Context</h2>       \${tbl(d.breakdown.byContext)}
+        <h2>By Provider</h2>      \${tbl(d.breakdown.byProvider)}
+        <h2>Rate Limits Hit</h2>  \${tbl(d.breakdown.rateLimitsByWindow)}
+        <h2>Daily Active Users</h2> \${tbl(d.users.dailyActive)}
+    \`
+}
+</script>
+</body></html>`)
+})
+
 // ─── /webhook/payment - Webhook endpoint — called by LemonSqueezy on payment ──────────────────────────────────────────────────────────────────
 
 app.post('/webhook/payment', express.raw({
